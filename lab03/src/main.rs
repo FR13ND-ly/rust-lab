@@ -22,7 +22,7 @@ fn next_prime(x: u16) -> Option<u16> {
 
     let mut num = x;
 
-    while num <= u16::MAX {
+    while num < u16::MAX {
         num += 1;
         let mut is_prime = true;
         for i in 2..=((num as f64).sqrt() as u16) {
@@ -224,9 +224,10 @@ fn test_convert(input: &str, from_str: &str, to_str: &str) {
 
 fn main() {
     println!("{}", bold(&blue("\nEx.1")));
-    let x = 2;
-    if let Some(p) = next_prime(x) {
+    let mut x = 2;
+    while let Some(p) = next_prime(x) {
         println!("Next prime after {}: {}", x, green(&p.to_string()));
+        x = p;
     }
 
     println!("{}", bold(&blue("\nEx.2")));
