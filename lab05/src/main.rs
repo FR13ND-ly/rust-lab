@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use std::fs;
 
 use serde_derive::Deserialize;
+use serde_json;
 
 fn red(s: &str) -> String {
     format!("\x1b[31m{}\x1b[0m", s)
@@ -138,7 +139,11 @@ fn draw() {
 fn find_students_json() -> Result<()> {
     let content = fs::read_to_string("ex3.json")?;
 
-    let students: Vec<Student> = serde_json::from_str(&content)?;
+    let students: Vec<Student> = content
+        .lines() 
+        .filter(|line| !line.trim().is_empty()) 
+        .map(|line| serde_json::from_str(line)) 
+        .collect::<Result<Vec<Student>, _>>()?; 
 
     if let Some(youngest_student) = students.iter().min_by_key(|s| s.age) {
         println!("{}: {}", green("Youngest"), youngest_student.name);
