@@ -29,13 +29,13 @@ impl StorageBackend for ZipBackend {
         self.file_path.to_string_lossy().to_string()
     }
 
+    fn is_read_only(&self) -> bool { true }
+
     async fn list_files(&self) -> Result<Vec<FileMetadata>> {
         let archive = self.archive.clone();
-        
         tokio::task::spawn_blocking(move || {
             let mut zip = archive.lock().unwrap();
             let mut files = Vec::new();
-            
             for i in 0..zip.len() {
                 if let Ok(file) = zip.by_index(i) {
                     if file.is_file() {
@@ -57,7 +57,6 @@ impl StorageBackend for ZipBackend {
     async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let archive = self.archive.clone();
         let path = path.to_string();
-        
         tokio::task::spawn_blocking(move || {
             let mut zip = archive.lock().unwrap();
             let mut file = zip.by_name(&path)?;
@@ -68,10 +67,10 @@ impl StorageBackend for ZipBackend {
     }
 
     async fn write_file(&self, _path: &str, _content: &[u8]) -> Result<()> {
-        Err(anyhow!("ZIP archives are Read-Only in Logos."))
+        Err(anyhow!("ZIP archives are Read-Only."))
     }
 
     async fn delete_file(&self, _path: &str) -> Result<()> {
-        Err(anyhow!("ZIP archives are Read-Only in Logos."))
+        Err(anyhow!("ZIP archives are Read-Only."))
     }
 }

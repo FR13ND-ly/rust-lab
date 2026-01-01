@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: logos
+      POSTGRES_PASSWORD: secure_password
+      POSTGRES_DB: logos_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://logos:secure_password@db:5432/logos_db
+      RUST_LOG: info
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:

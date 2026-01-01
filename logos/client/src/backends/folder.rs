@@ -15,7 +15,10 @@ impl FolderBackend {
         if !path.exists() {
             std::fs::create_dir_all(&path).expect("Failed to create root directory");
         }
-        Self { root: path }
+    
+        let absolute_root = std::fs::canonicalize(&path).unwrap_or(path);
+
+        Self { root: absolute_root }
     }
 
     fn to_full_path(&self, relative: &str) -> PathBuf {
@@ -29,7 +32,6 @@ impl FolderBackend {
                 if is_file_locked(&e) {
                     println!("⚠️ File Locked: {:?}. Creating conflict copy.", path);
                     let new_path = generate_conflict_name(&path);
-                    
                     fs::write(&new_path, content).await.context("Failed to write conflict copy")?;
                     Ok(())
                 } else {
@@ -83,11 +85,9 @@ impl StorageBackend for FolderBackend {
 
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
         let full_path = self.to_full_path(path);
-        
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-
         self.safe_write(full_path, content).await
     }
 
@@ -113,7 +113,6 @@ fn generate_conflict_name(path: &Path) -> PathBuf {
     let ext = path.extension()
         .map(|e| format!(".{}", e.to_string_lossy()))
         .unwrap_or_default();
-    
     let new_name = format!("{} (Logos Copy){}", stem, ext);
     path.with_file_name(new_name)
 }

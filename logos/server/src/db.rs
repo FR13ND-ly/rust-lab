@@ -1,28 +1,66 @@
-use common::FileMetadata;
+use common::{FileMetadata, StorageInfo};
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
 
 pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS storages (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            name TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        "#
+    ).execute(pool).await?;
+
+    let _ = sqlx::query("DROP TABLE IF EXISTS files").execute(pool).await;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS files (
-            path TEXT PRIMARY KEY,
+            storage_id UUID NOT NULL REFERENCES storages(id),
+            path TEXT NOT NULL,
             size BIGINT NOT NULL,
             modified BIGINT NOT NULL,
             version BIGINT NOT NULL,
             hash TEXT NOT NULL,
-            is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+            is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+            PRIMARY KEY (storage_id, path)
         );
         "#
-    )
-    .execute(pool)
-    .await?;
+    ).execute(pool).await?;
     
     Ok(())
 }
 
-pub async fn load_state(pool: &Pool<Postgres>) -> Result<HashMap<String, FileMetadata>, sqlx::Error> {
-    let rows = sqlx::query("SELECT path, size, modified, version, hash, is_deleted FROM files")
+pub async fn list_storages(pool: &Pool<Postgres>) -> Result<Vec<StorageInfo>, sqlx::Error> {
+    let rows = sqlx::query("SELECT id, name FROM storages ORDER BY name ASC")
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows.into_iter().map(|r| StorageInfo {
+        id: r.get::<uuid::Uuid, _>("id").to_string(),
+        name: r.get("name"),
+    }).collect())
+}
+
+pub async fn create_storage(pool: &Pool<Postgres>, name: &str) -> Result<StorageInfo, sqlx::Error> {
+    let row = sqlx::query("INSERT INTO storages (name) VALUES ($1) RETURNING id, name")
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(StorageInfo {
+        id: row.get::<uuid::Uuid, _>("id").to_string(),
+        name: row.get("name"),
+    })
+}
+
+pub async fn load_storage_files(pool: &Pool<Postgres>, storage_id: &str) -> Result<HashMap<String, FileMetadata>, sqlx::Error> {
+    let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
+    
+    let rows = sqlx::query("SELECT path, size, modified, version, hash, is_deleted FROM files WHERE storage_id = $1")
+        .bind(uuid)
         .fetch_all(pool)
         .await?;
 
@@ -41,12 +79,14 @@ pub async fn load_state(pool: &Pool<Postgres>) -> Result<HashMap<String, FileMet
     Ok(map)
 }
 
-pub async fn save_file(pool: &Pool<Postgres>, meta: &FileMetadata) -> Result<(), sqlx::Error> {
+pub async fn save_file(pool: &Pool<Postgres>, storage_id: &str, meta: &FileMetadata) -> Result<(), sqlx::Error> {
+    let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
+
     sqlx::query(
         r#"
-        INSERT INTO files (path, size, modified, version, hash, is_deleted)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (path) DO UPDATE
+        INSERT INTO files (storage_id, path, size, modified, version, hash, is_deleted)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (storage_id, path) DO UPDATE
         SET size = EXCLUDED.size,
             modified = EXCLUDED.modified,
             version = EXCLUDED.version,
@@ -54,6 +94,7 @@ pub async fn save_file(pool: &Pool<Postgres>, meta: &FileMetadata) -> Result<(),
             is_deleted = EXCLUDED.is_deleted
         "#
     )
+    .bind(uuid)
     .bind(&meta.path)
     .bind(meta.size as i64)
     .bind(meta.modified as i64)

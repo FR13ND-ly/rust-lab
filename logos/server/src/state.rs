@@ -1,4 +1,4 @@
-use common::{FileMetadata, Message};
+use common::{FileMetadata, Message, DashboardMessage};
 use dashmap::DashMap;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
@@ -6,63 +6,97 @@ use tokio::sync::mpsc;
 use crate::db;
 
 pub type ClientSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
+pub type DashboardSender = mpsc::UnboundedSender<axum::extract::ws::Message>;
+
+pub struct StorageRoom {
+    pub files: DashMap<String, FileMetadata>,
+    pub clients: DashMap<String, ClientSender>,
+}
+
+impl StorageRoom {
+    pub fn new() -> Self {
+        Self {
+            files: DashMap::new(),
+            clients: DashMap::new(),
+        }
+    }
+}
 
 pub struct AppState {
-    pub file_index: DashMap<String, FileMetadata>,
-    pub clients: DashMap<String, ClientSender>,
+    pub rooms: DashMap<String, Arc<StorageRoom>>, 
+    pub dashboards: DashMap<usize, DashboardSender>,
     pub db: Pool<Postgres>,
 }
 
 impl AppState {
     pub async fn new(db_url: &str) -> Self {
         let pool = Pool::<Postgres>::connect(db_url).await.expect("Failed to connect to DB");
-        
         db::init_db(&pool).await.expect("Failed to init DB schema");
-
-        let loaded_files = db::load_state(&pool).await.expect("Failed to load state");
-        tracing::info!("💾 Loaded {} files from Database.", loaded_files.len());
-
-        let index = DashMap::new();
-        for (k, v) in loaded_files {
-            index.insert(k, v);
-        }
-
+        
         Self {
-            file_index: index,
-            clients: DashMap::new(),
+            rooms: DashMap::new(),
+            dashboards: DashMap::new(),
             db: pool,
         }
     }
 
-    pub async fn process_update(&self, incoming: FileMetadata) -> Option<FileMetadata> {
-        if let Some(existing) = self.file_index.get(&incoming.path) {
-            
-            if existing.is_deleted && !incoming.is_deleted && incoming.version < existing.version {
-                return None; 
-            }
+    pub async fn get_or_load_room(&self, storage_id: &str) -> Arc<StorageRoom> {
+        if let Some(room) = self.rooms.get(storage_id) {
+            return room.clone();
+        }
 
-            if incoming.version <= existing.version {
-                return None;
-            }
+        let files = db::load_storage_files(&self.db, storage_id).await.unwrap_or_default();
+        let room = Arc::new(StorageRoom::new());
+        for (k, v) in files {
+            room.files.insert(k, v);
+        }
+
+        self.rooms.insert(storage_id.to_string(), room.clone());
+        room
+    }
+
+    pub async fn process_update(&self, storage_id: &str, incoming: FileMetadata) -> Option<FileMetadata> {
+        let room = self.get_or_load_room(storage_id).await;
+
+        if let Some(existing) = room.files.get(&incoming.path) {
+            if existing.is_deleted && !incoming.is_deleted && incoming.version < existing.version { return None; }
+            if incoming.version <= existing.version { return None; }
         }
 
         let new_state = incoming.clone();
-        
-        if let Err(e) = db::save_file(&self.db, &new_state).await {
+        if let Err(e) = db::save_file(&self.db, storage_id, &new_state).await {
             tracing::error!("🔥 DB Error: {}", e);
             return None;
         }
-        self.file_index.insert(new_state.path.clone(), new_state.clone());
+
+        room.files.insert(new_state.path.clone(), new_state.clone());
+        self.emit_log("info", &format!("File updated in {}: {}", storage_id, new_state.path));
         
         Some(new_state)
     }
 
-    pub fn broadcast(&self, sender_id: &str, msg: axum::extract::ws::Message) {
-        for client in self.clients.iter() {
-            if client.key() != sender_id {
-                let _ = client.value().send(msg.clone());
+    pub async fn broadcast(&self, storage_id: &str, sender_id: &str, msg: axum::extract::ws::Message) {
+        if let Some(room) = self.rooms.get(storage_id) {
+            for client in room.clients.iter() {
+                if client.key() != sender_id {
+                    let _ = client.value().send(msg.clone());
+                }
             }
         }
+    }
+
+    pub fn emit_log(&self, level: &str, message: &str) {
+        let msg = DashboardMessage::Log {
+            level: level.to_string(),
+            message: message.to_string(),
+            timestamp: chrono::Utc::now().timestamp() as u64,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+    }
+
+    fn broadcast_dashboard(&self, msg: axum::extract::ws::Message) {
+        self.dashboards.retain(|_, tx| tx.send(msg.clone()).is_ok());
     }
 }
 
