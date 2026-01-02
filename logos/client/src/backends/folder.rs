@@ -22,7 +22,9 @@ impl FolderBackend {
     }
 
     fn to_full_path(&self, relative: &str) -> PathBuf {
-        self.root.join(relative)
+        // Ensure we handle incoming protocol paths (always /) correctly on Windows
+        let valid_relative = relative.replace("/", std::path::MAIN_SEPARATOR_STR);
+        self.root.join(valid_relative)
     }
 
     async fn safe_write(&self, path: PathBuf, content: &[u8]) -> Result<()> {
@@ -56,7 +58,10 @@ impl StorageBackend for FolderBackend {
             for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
                 if entry.file_type().is_file() {
                     if let Ok(metadata) = entry.metadata() {
-                        let path = entry.path().strip_prefix(&root).unwrap().to_string_lossy().replace("\\", "/");
+                        // Crucial: Normalize backslashes to forward slashes for the server
+                        let path = entry.path().strip_prefix(&root).unwrap()
+                            .to_string_lossy()
+                            .replace("\\", "/");
                         
                         if path.starts_with(".git") || path.starts_with("target") { continue; }
 
@@ -68,6 +73,7 @@ impl StorageBackend for FolderBackend {
                             version: 0,
                             hash: String::new(),
                             is_deleted: false,
+                            last_modified_by: None,
                         });
                     }
                 }
@@ -85,9 +91,12 @@ impl StorageBackend for FolderBackend {
 
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<()> {
         let full_path = self.to_full_path(path);
+        
+        // Ensure parent directories exist
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
         }
+        
         self.safe_write(full_path, content).await
     }
 

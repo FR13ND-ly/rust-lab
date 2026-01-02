@@ -20,6 +20,7 @@ pub async fn ws_handler(
 enum SessionState {
     Lobby,
     Synced { storage_id: String },
+    Dashboard,
 }
 
 enum TransferState {
@@ -40,12 +41,21 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
     let mut session = SessionState::Lobby;
     let mut transfer_state = TransferState::Idle;
     let client_id = uuid::Uuid::new_v4().to_string();
+    let dashboard_id = rand::random::<usize>();
+    let mut client_name = "Unknown".to_string();
 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             WsMessage::Text(text) => {
                 if let Ok(parsed) = serde_json::from_str::<Message>(&text) {
                     match parsed {
+                        Message::RegisterDashboard => {
+                            state.dashboards.insert(dashboard_id, tx.clone());
+                            session = SessionState::Dashboard;
+                            client_name = "Dashboard".to_string();
+                            state.emit_log("info", "New Dashboard connected");
+                            state.emit_stats();
+                        },
                         Message::RequestStorageList => {
                             if let Ok(list) = db::list_storages(&state.db).await {
                                 let resp = Message::StorageList { storages: list };
@@ -54,10 +64,14 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                         },
                         Message::CreateStorage { name } => {
                             match db::create_storage(&state.db, &name).await {
-                                Ok(info) => {
-                                    if let Ok(list) = db::list_storages(&state.db).await {
-                                        let resp = Message::StorageList { storages: list };
-                                        tx.send(WsMessage::Text(serde_json::to_string(&resp).unwrap())).ok();
+                                Ok(_) => {
+                                    state.emit_storage_list().await;
+                                    
+                                    if !matches!(session, SessionState::Dashboard) {
+                                        if let Ok(list) = db::list_storages(&state.db).await {
+                                            let resp = Message::StorageList { storages: list };
+                                            tx.send(WsMessage::Text(serde_json::to_string(&resp).unwrap())).ok();
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -66,10 +80,44 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                                 }
                             }
                         },
-                        Message::JoinStorage { storage_id } => {
+                        Message::DeleteStorage { storage_id } => {
+                            match db::delete_storage(&state.db, &storage_id).await {
+                                Ok(_) => {
+                                    state.rooms.remove(&storage_id);
+                                    let upload_dir = PathBuf::from("uploads").join(&storage_id);
+                                    if upload_dir.exists() {
+                                        let _ = fs::remove_dir_all(upload_dir).await;
+                                    }
+                                    state.emit_log("info", &format!("Storage deleted: {}", storage_id));
+                                    
+                                    state.emit_storage_list().await;
+                                    
+                                    if !matches!(session, SessionState::Dashboard) {
+                                        if let Ok(list) = db::list_storages(&state.db).await {
+                                            let resp = Message::StorageList { storages: list };
+                                            tx.send(WsMessage::Text(serde_json::to_string(&resp).unwrap())).ok();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    state.emit_log("error", &format!("Failed to delete storage: {}", e));
+                                    let err = Message::Error { message: format!("Delete failed: {}", e) };
+                                    tx.send(WsMessage::Text(serde_json::to_string(&err).unwrap())).ok();
+                                }
+                            }
+                        },
+                        Message::JoinStorage { storage_id, client_name: name } => {
+                            if let SessionState::Synced { storage_id: old_id } = &session {
+                                if let Some(old_room) = state.rooms.get(old_id) {
+                                    old_room.clients.remove(&client_id);
+                                    old_room.client_names.remove(&client_id);
+                                }
+                            }
+
+                            client_name = name;
                             let room = state.get_or_load_room(&storage_id).await;
-                            
                             room.clients.insert(client_id.clone(), tx.clone());
+                            room.client_names.insert(client_id.clone(), client_name.clone());
                             
                             let mut files = Vec::new();
                             for entry in room.files.iter() {
@@ -78,21 +126,16 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                             let welcome = Message::Welcome { storage_id: storage_id.clone(), files };
                             tx.send(WsMessage::Text(serde_json::to_string(&welcome).unwrap())).ok();
                             
-                            state.emit_log("info", &format!("Client {} joined storage {}", client_id, &storage_id));
-                            session = SessionState::Synced { storage_id };
+                            session = SessionState::Synced { storage_id: storage_id.clone() };
+                            state.emit_log("info", &format!("{} joined storage {}", client_name, storage_id));
+                            state.emit_stats();
                         },
-                        
                         Message::StartTransfer { path, size, target_version } => {
                             if let SessionState::Synced { storage_id } = &session {
                                 let room = state.get_or_load_room(storage_id).await;
-                                
                                 let effective_version = if target_version == 0 {
-                                    room.files.get(&path)
-                                        .map(|existing| existing.version + 1)
-                                        .unwrap_or(1)
-                                } else {
-                                    target_version
-                                };
+                                    room.files.get(&path).map(|e| e.version + 1).unwrap_or(1)
+                                } else { target_version };
 
                                 let meta = FileMetadata {
                                     path: path.clone(),
@@ -101,6 +144,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                                     version: effective_version,
                                     hash: String::new(),
                                     is_deleted: false,
+                                    last_modified_by: Some(client_name.clone()),
                                 };
                                 transfer_state = TransferState::ExpectingBinary { path, meta };
                             }
@@ -120,7 +164,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                                         };
                                         tx.send(WsMessage::Text(serde_json::to_string(&header).unwrap())).ok();
                                         tx.send(WsMessage::Binary(content)).ok();
-                                        state.emit_log("info", &format!("Serving conflict recovery for {}", path));
+                                        state.emit_log("info", &format!("Serving file {} to {}", path, client_name));
                                     }
                                 }
                             }
@@ -129,7 +173,6 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                             if let SessionState::Synced { storage_id } = &session {
                                 let room = state.get_or_load_room(storage_id).await;
                                 let version = room.files.get(&path).map(|m| m.version + 1).unwrap_or(1);
-
                                 let meta = FileMetadata {
                                     path: path.clone(),
                                     size: 0,
@@ -137,8 +180,8 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                                     version,
                                     hash: String::new(),
                                     is_deleted: true,
+                                    last_modified_by: Some(client_name.clone()),
                                 };
-
                                 if let Some(updated) = state.process_update(storage_id, meta).await {
                                     let json = serde_json::to_string(&Message::DeleteFile { path: updated.path }).unwrap();
                                     state.broadcast(storage_id, &client_id, WsMessage::Text(json)).await;
@@ -153,14 +196,10 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                 if let SessionState::Synced { storage_id } = &session {
                     if let TransferState::ExpectingBinary { path, mut meta } = transfer_state {
                         meta.hash = common::calculate_hash(&data);
-
                         if let Some(updated_meta) = state.process_update(storage_id, meta).await {
                             let upload_dir = PathBuf::from("uploads").join(storage_id);
                             let file_path = upload_dir.join(&path);
-                            
-                            if let Some(parent) = file_path.parent() {
-                                fs::create_dir_all(parent).await.ok();
-                            }
+                            if let Some(parent) = file_path.parent() { fs::create_dir_all(parent).await.ok(); }
                             fs::write(&file_path, &data).await.ok();
 
                             let header = Message::StartTransfer { 
@@ -169,16 +208,16 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                                 target_version: updated_meta.version 
                             };
                             let json = serde_json::to_string(&header).unwrap();
-                            
                             state.broadcast(storage_id, &client_id, WsMessage::Text(json)).await;
                             state.broadcast(storage_id, &client_id, WsMessage::Binary(data)).await;
+
+                            let update_msg = Message::FileUpdate { meta: updated_meta };
+                            let update_json = serde_json::to_string(&update_msg).unwrap();
+                            state.broadcast(storage_id, &client_id, WsMessage::Text(update_json)).await;
                         } else {
                             let room = state.get_or_load_room(storage_id).await;
                             if let Some(current) = room.files.get(&path) {
-                                let err = Message::ConflictDetected { 
-                                    path: path.clone(), 
-                                    server_version: current.version 
-                                };
+                                let err = Message::ConflictDetected { path: path.clone(), server_version: current.version };
                                 tx.send(WsMessage::Text(serde_json::to_string(&err).unwrap())).ok();
                             }
                         }
@@ -190,10 +229,21 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
         }
     }
 
-    if let SessionState::Synced { storage_id } = &session {
-         if let Some(room) = state.rooms.get(storage_id) {
-             room.clients.remove(&client_id);
-         }
+    state.dashboards.remove(&dashboard_id);
+
+    match session {
+        SessionState::Synced { storage_id } => {
+             if let Some(room) = state.rooms.get(&storage_id) {
+                 room.clients.remove(&client_id);
+                 room.client_names.remove(&client_id);
+                 state.emit_stats();
+                 state.emit_log("info", &format!("Client disconnected from {}", storage_id));
+             }
+        }
+        SessionState::Dashboard => {
+            state.emit_stats();
+        }
+        _ => {}
     }
     send_task.abort();
 }

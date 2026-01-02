@@ -1,6 +1,7 @@
 mod args;
 mod backend;
 mod backends;
+mod config;
 
 use args::{Args, Location};
 use backend::StorageBackend;
@@ -21,15 +22,33 @@ use dialoguer::{theme::ColorfulTheme, Input, Select};
 
 enum TransferState {
     Idle,
-    ExpectingBinary { path: String, version: u64 },
+    ExpectingBinary { path: String },
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
     
-    let loc = args.locations.first().expect("No location provided");
-    let backend: Arc<Box<dyn StorageBackend>> = match Location::parse(loc) {
+    let config_path = args.config.clone().unwrap_or_else(|| "logos_config.json".to_string());
+    let mut config = config::AppConfig::load(&config_path).await;
+
+    let client_name = if let Some(name) = &config.client_name {
+        name.clone()
+    } else {
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "Unknown Client".to_string())
+    };
+
+    let loc_str = if !args.locations.is_empty() {
+        args.locations.first().cloned()
+    } else {
+        config.location.clone()
+    };
+
+    let loc_str = loc_str.expect("❌ No storage location provided. Use args (folder:./path) or config file.");
+
+    let backend: Arc<Box<dyn StorageBackend>> = match Location::parse(&loc_str) {
         Ok(Location::Folder(path)) => Arc::new(Box::new(FolderBackend::new(path))),
         Ok(Location::Ftp(url)) => {
             println!("🔌 Connecting to FTP: {}", url);
@@ -48,23 +67,30 @@ async fn main() {
         Err(e) => panic!("Invalid location: {}", e),
     };
 
-    println!("🚀 Logos Client started.");
+    println!("🚀 Logos Client started as '{}'", client_name);
 
     let url = "ws://localhost:3000/ws/client";
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect to Server");
     let (mut ws_write, mut ws_read) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
-    let mut send_task = tokio::spawn(async move {
+    let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_write.send(msg).await.is_err() { break; }
         }
     });
 
-    let mut storage_id = String::new();
     let mut initial_files = Vec::new();
 
-    tx.send(WsMessage::Text(serde_json::to_string(&Message::RequestStorageList).unwrap())).unwrap();
+    if let Some(target_id) = &config.storage_id {
+        println!("⚙️ Auto-joining storage from config: {}", target_id);
+        tx.send(WsMessage::Text(serde_json::to_string(&Message::JoinStorage { 
+            storage_id: target_id.clone(),
+            client_name: client_name.clone()
+        }).unwrap())).unwrap();
+    } else {
+        tx.send(WsMessage::Text(serde_json::to_string(&Message::RequestStorageList).unwrap())).unwrap();
+    }
 
     while let Some(Ok(msg)) = ws_read.next().await {
         if let WsMessage::Text(text) = msg {
@@ -89,7 +115,10 @@ async fn main() {
                         if selection < storages.len() {
                             let selected = &storages[selection];
                             println!("Joining {}...", selected.name);
-                            tx.send(WsMessage::Text(serde_json::to_string(&Message::JoinStorage { storage_id: selected.id.clone() }).unwrap())).unwrap();
+                            tx.send(WsMessage::Text(serde_json::to_string(&Message::JoinStorage { 
+                                storage_id: selected.id.clone(),
+                                client_name: client_name.clone()
+                            }).unwrap())).unwrap();
                         } else if selection == storages.len() {
                             let name: String = Input::with_theme(&ColorfulTheme::default())
                                 .with_prompt("Enter new storage name")
@@ -102,12 +131,22 @@ async fn main() {
                     },
                     Message::Welcome { storage_id: sid, files } => {
                         println!("✅ Successfully joined Storage!");
-                        storage_id = sid;
                         initial_files = files;
-                        break; 
+
+                        println!("💾 Updating configuration...");
+                        config.client_name = Some(client_name.clone());
+                        config.location = Some(loc_str.clone());
+                        config.storage_id = Some(sid);
+                        config.save(&config_path).await;
+
+                        break;
                     },
                     Message::Error { message } => {
                         println!("❌ Error: {}", message);
+                        if config.storage_id.is_some() {
+                            println!("⚠️ Auto-join failed. Clearing saved storage ID.");
+                            config.storage_id = None;
+                        }
                         tx.send(WsMessage::Text(serde_json::to_string(&Message::RequestStorageList).unwrap())).unwrap();
                     }
                     _ => {}
@@ -117,36 +156,52 @@ async fn main() {
     }
 
     println!("🔄 Starting Synchronization...");
-    
     let synced_hashes = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     let pending_deletes = Arc::new(Mutex::new(HashSet::<String>::new()));
-    
     let mut transfer_state = TransferState::Idle;
 
     if let Ok(local_files) = backend.list_files().await {
+        println!("ℹ️  Found {} files in local backend.", local_files.len());
+
         for local in &local_files {
             let remote = initial_files.iter().find(|f| f.path == local.path);
             let needs_upload = match remote {
                 None => true, 
-                Some(r) => !r.is_deleted && local.modified > r.modified
+                Some(r) => local.modified > r.modified
             };
 
             if needs_upload {
-                if let Ok(content) = backend.read_file(&local.path).await {
-                     let hash = calculate_hash(&content);
-                     synced_hashes.lock().unwrap().insert(local.path.clone(), hash);
+                match backend.read_file(&local.path).await {
+                     Ok(content) => {
+                         if local.modified > 40_000_000_000 {
+                            println!("⚠️  Warning: Local file '{}' has a very large timestamp ({}). This might prevent future updates.", local.path, local.modified);
+                         }
 
-                     let header = Message::StartTransfer { 
-                        path: local.path.clone(), 
-                        size: content.len() as u64, 
-                        target_version: 0 
-                    };
-                    tx.send(WsMessage::Text(serde_json::to_string(&header).unwrap())).unwrap();
-                    tx.send(WsMessage::Binary(content)).unwrap();
-                    println!("📤 Uploading: {}", local.path);
+                         let hash = calculate_hash(&content);
+                         synced_hashes.lock().unwrap().insert(local.path.clone(), hash);
+
+                         let header = Message::StartTransfer { 
+                            path: local.path.clone(), 
+                            size: content.len() as u64, 
+                            target_version: 0 
+                        };
+                        tx.send(WsMessage::Text(serde_json::to_string(&header).unwrap())).unwrap();
+                        tx.send(WsMessage::Binary(content)).unwrap();
+                        println!("📤 Uploading: {}", local.path);
+                     },
+                     Err(e) => {
+                         eprintln!("⚠️ Failed to read file for upload '{}': {}", local.path, e);
+                     }
                 }
-            } else {
-                // to do
+            } else if let Some(r) = remote {
+                println!("⏹️  Skipping '{}': Local (v{}) <= Remote (v{}) [Deleted: {}]", local.path, local.modified, r.modified, r.is_deleted);
+                let will_download = !r.is_deleted && r.modified > local.modified;
+                if !will_download && !r.is_deleted {
+                    if let Ok(content) = backend.read_file(&local.path).await {
+                        let hash = calculate_hash(&content);
+                        synced_hashes.lock().unwrap().insert(local.path.clone(), hash);
+                    }
+                }
             }
         }
 
@@ -167,99 +222,152 @@ async fn main() {
                 }
             }
         }
+    } else {
+        eprintln!("⚠️ Failed to list local files. Is the path correct?");
     }
 
     let mut _watcher_guard: Option<RecommendedWatcher> = None;
 
     if !backend.is_read_only() {
-        if let Ok(Location::Folder(_)) = Location::parse(loc) {
+        if let Ok(Location::Folder(raw_path)) = Location::parse(&loc_str) {
             let tx_watcher = tx.clone();
             let backend_watcher = backend.clone();
             let hashes_watcher = synced_hashes.clone();
             let deletes_watcher = pending_deletes.clone();
-            let root_path_str = backend.get_id();
-            let folder_path = Path::new(&root_path_str);
+            
+            let abs_root = std::fs::canonicalize(&raw_path).unwrap_or(raw_path);
+            let folder_path = abs_root.clone();
             
             let (notify_tx, mut notify_rx) = mpsc::unbounded_channel();
             let mut watcher = RecommendedWatcher::new(move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res { notify_tx.send(event).ok(); }
             }, notify::Config::default()).unwrap();
 
-            if let Err(e) = watcher.watch(folder_path, RecursiveMode::Recursive) {
+            if let Err(e) = watcher.watch(&folder_path, RecursiveMode::Recursive) {
                 eprintln!("❌ Watcher failed to start: {}", e);
             }
             _watcher_guard = Some(watcher);
 
+            let value = synced_hashes.clone();
             tokio::spawn(async move {
+                let to_relative = |sys_path: &Path| -> Option<String> {
+                     sys_path.strip_prefix(&abs_root).ok()
+                        .map(|p| p.to_string_lossy().replace("\\", "/"))
+                        .filter(|s| !s.is_empty())
+                };
+
                 while let Some(event) = notify_rx.recv().await {
                     match event.kind {
                         EventKind::Create(_) | EventKind::Modify(_) => {
-                            for path in event.paths {
-                                let path_str = path.to_string_lossy();
-                                let root_str = root_path_str.as_str();
-                                let clean_path = path_str.trim_start_matches(r"\\?\");
-                                let clean_root = root_str.trim_start_matches(r"\\?\");
-                                
-                                let relative_str = if clean_path.starts_with(clean_root) {
-                                    clean_path[clean_root.len()..].trim_start_matches(std::path::MAIN_SEPARATOR)
-                                } else { continue; };
+                            if event.paths.len() == 2 {
+                                let old_path = &event.paths[0];
+                                let new_path = &event.paths[1];
 
-                                let relative = relative_str.replace("\\", "/");
-                                if relative.is_empty() { continue; }
-
-                                let mut attempts = 0;
-                                while attempts < 5 {
-                                    if let Ok(content) = backend_watcher.read_file(&relative).await {
-                                        let hash = calculate_hash(&content);
-                                        
-                                        {
-                                            let mut guard = hashes_watcher.lock().unwrap();
-                                            if let Some(known_hash) = guard.get(&relative) {
-                                                if known_hash == &hash {
-                                                    break; 
-                                                }
-                                            }
-                                            guard.insert(relative.clone(), hash);
+                                if let Some(relative_old) = to_relative(old_path) {
+                                     let mut files_to_delete = Vec::new();
+                                     {
+                                        let mut guard = hashes_watcher.lock().unwrap();
+                                        if guard.contains_key(&relative_old) { files_to_delete.push(relative_old.clone()); }
+                                        let dir_prefix = format!("{}/", relative_old);
+                                        for key in guard.keys() {
+                                            if key.starts_with(&dir_prefix) { files_to_delete.push(key.clone()); }
                                         }
+                                        for f in &files_to_delete { guard.remove(f); }
+                                     }
+                                     for f in files_to_delete {
+                                         let msg = Message::DeleteFile { path: f };
+                                         tx_watcher.send(WsMessage::Text(serde_json::to_string(&msg).unwrap())).ok();
+                                     }
+                                }
 
-                                        let header = Message::StartTransfer { 
-                                            path: relative.clone(), 
-                                            size: content.len() as u64, 
-                                            target_version: 0 
-                                        };
-                                        tx_watcher.send(WsMessage::Text(serde_json::to_string(&header).unwrap())).ok();
-                                        tx_watcher.send(WsMessage::Binary(content)).ok();
-                                        println!("📤 Uploading: {}", relative);
-                                        break;
+                                if let Some(relative_new) = to_relative(new_path) {
+                                    if new_path.is_file() {
+                                        if let Ok(content) = backend_watcher.read_file(&relative_new).await {
+                                            let hash = calculate_hash(&content);
+                                            value.lock().unwrap().insert(relative_new.clone(), hash);
+                                            let header = Message::StartTransfer { 
+                                                path: relative_new.clone(), 
+                                                size: content.len() as u64, 
+                                                target_version: 0 
+                                            };
+                                            tx_watcher.send(WsMessage::Text(serde_json::to_string(&header).unwrap())).ok();
+                                            tx_watcher.send(WsMessage::Binary(content)).ok();
+                                            println!("📤 Uploading (Renamed): {}", relative_new);
+                                        }
                                     }
-                                    attempts += 1;
-                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                }
+                                continue;
+                            }
+
+                            for path in event.paths {
+                                if let Some(relative) = to_relative(&path) {
+                                    let mut attempts = 0;
+                                    while attempts < 5 {
+                                        if let Ok(content) = backend_watcher.read_file(&relative).await {
+                                            let hash = calculate_hash(&content);
+                                            
+                                            {
+                                                let mut guard = hashes_watcher.lock().unwrap();
+                                                if let Some(known_hash) = guard.get(&relative) {
+                                                    if known_hash == &hash { break; }
+                                                }
+                                                guard.insert(relative.clone(), hash);
+                                            }
+
+                                            let header = Message::StartTransfer { 
+                                                path: relative.clone(), 
+                                                size: content.len() as u64, 
+                                                target_version: 0 
+                                            };
+                                            tx_watcher.send(WsMessage::Text(serde_json::to_string(&header).unwrap())).ok();
+                                            tx_watcher.send(WsMessage::Binary(content)).ok();
+                                            println!("📤 Uploading: {}", relative);
+                                            break;
+                                        }
+                                        attempts += 1;
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    }
                                 }
                             }
                         }
+                        
                         EventKind::Remove(_) => {
                              for path in event.paths {
-                                let path_str = path.to_string_lossy();
-                                let root_str = root_path_str.as_str();
-                                let clean_path = path_str.trim_start_matches(r"\\?\");
-                                let clean_root = root_str.trim_start_matches(r"\\?\");
-                                let relative_str = if clean_path.starts_with(clean_root) {
-                                    clean_path[clean_root.len()..].trim_start_matches(std::path::MAIN_SEPARATOR)
-                                } else { continue; };
+                                if let Some(relative) = to_relative(&path) {
+                                    let mut files_to_delete = Vec::new();
+                                    {
+                                        let mut guard = hashes_watcher.lock().unwrap();
+                                        
+                                        if guard.contains_key(&relative) {
+                                            files_to_delete.push(relative.clone());
+                                        }
 
-                                let relative = relative_str.replace("\\", "/");
-                                
-                                {
-                                    let mut guard = deletes_watcher.lock().unwrap();
-                                    if guard.contains(&relative) {
-                                        guard.remove(&relative);
-                                        continue;
+                                        let dir_prefix = format!("{}/", relative);
+                                        for key in guard.keys() {
+                                            if key.starts_with(&dir_prefix) {
+                                                files_to_delete.push(key.clone());
+                                            }
+                                        }
+                                        
+                                        for f in &files_to_delete {
+                                            guard.remove(f);
+                                        }
+                                    }
+
+                                    for f in files_to_delete {
+                                        {
+                                            let mut d_guard = deletes_watcher.lock().unwrap();
+                                            if d_guard.contains(&f) {
+                                                d_guard.remove(&f);
+                                                continue; 
+                                            }
+                                        }
+
+                                        let msg = Message::DeleteFile { path: f.clone() };
+                                        tx_watcher.send(WsMessage::Text(serde_json::to_string(&msg).unwrap())).ok();
+                                        println!("🗑️ Deleting: {}", f);
                                     }
                                 }
-
-                                let msg = Message::DeleteFile { path: relative.clone() };
-                                tx_watcher.send(WsMessage::Text(serde_json::to_string(&msg).unwrap())).ok();
-                                println!("🗑️ Deleting: {}", relative);
                             }
                         }
                         _ => {}
@@ -274,11 +382,11 @@ async fn main() {
             WsMessage::Text(text) => {
                 if let Ok(parsed) = serde_json::from_str::<Message>(&text) {
                     match parsed {
-                        Message::StartTransfer { path, size: _, target_version } => {
+                        Message::StartTransfer { path, size: _, target_version: _ } => {
                             if backend.is_read_only() {
                                 println!("🔒 Ignoring update for Read-Only backend: {}", path);
                             } else {
-                                transfer_state = TransferState::ExpectingBinary { path, version: target_version };
+                                transfer_state = TransferState::ExpectingBinary { path };
                             }
                         }
                         Message::DeleteFile { path } => {
@@ -303,14 +411,11 @@ async fn main() {
                             if let Ok(content) = backend.read_file(&path).await {
                                 if let Ok(_) = backend.write_file(&conflict_name, &content).await {
                                     println!("⚠️ Saved conflict copy to '{}'", conflict_name);
-                                    
                                     if let Err(e) = backend.delete_file(&path).await {
                                         eprintln!("❌ Failed to remove original conflict file: {}", e);
                                     } else {
                                         tx.send(WsMessage::Text(serde_json::to_string(&Message::RequestFile { path: path.clone() }).unwrap())).unwrap();
                                     }
-                                } else {
-                                    eprintln!("❌ Failed to write conflict copy. Keeping original.");
                                 }
                             }
                         }
@@ -319,14 +424,15 @@ async fn main() {
                 }
             }
             WsMessage::Binary(data) => {
-                if let TransferState::ExpectingBinary { path, version } = transfer_state {
-                    println!("📥 Downloading: {} (v{})", path, version);
-                    
+                if let TransferState::ExpectingBinary { path } = transfer_state {
+                    println!("📥 Downloading: {}", path);
                     let hash = calculate_hash(&data);
                     synced_hashes.lock().unwrap().insert(path.clone(), hash);
-
-                    let _ = backend.write_file(&path, &data).await;
                     
+                    let normalized_path = path.replace("/", std::path::MAIN_SEPARATOR_STR);
+                    if let Err(e) = backend.write_file(&normalized_path, &data).await {
+                        eprintln!("❌ Failed to write file {}: {}", path, e);
+                    }
                     transfer_state = TransferState::Idle;
                 }
             }

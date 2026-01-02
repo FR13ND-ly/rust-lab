@@ -13,8 +13,6 @@ pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
         "#
     ).execute(pool).await?;
 
-    let _ = sqlx::query("DROP TABLE IF EXISTS files").execute(pool).await;
-
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS files (
@@ -25,13 +23,17 @@ pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
             version BIGINT NOT NULL,
             hash TEXT NOT NULL,
             is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+            last_modified_by TEXT,
             PRIMARY KEY (storage_id, path)
         );
         "#
     ).execute(pool).await?;
+
+    let _ = sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS last_modified_by TEXT").execute(pool).await;
     
     Ok(())
 }
+
 
 pub async fn list_storages(pool: &Pool<Postgres>) -> Result<Vec<StorageInfo>, sqlx::Error> {
     let rows = sqlx::query("SELECT id, name FROM storages ORDER BY name ASC")
@@ -56,10 +58,19 @@ pub async fn create_storage(pool: &Pool<Postgres>, name: &str) -> Result<Storage
     })
 }
 
+pub async fn delete_storage(pool: &Pool<Postgres>, storage_id: &str) -> Result<(), sqlx::Error> {
+    let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM files WHERE storage_id = $1").bind(uuid).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM storages WHERE id = $1").bind(uuid).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn load_storage_files(pool: &Pool<Postgres>, storage_id: &str) -> Result<HashMap<String, FileMetadata>, sqlx::Error> {
     let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
     
-    let rows = sqlx::query("SELECT path, size, modified, version, hash, is_deleted FROM files WHERE storage_id = $1")
+    let rows = sqlx::query("SELECT path, size, modified, version, hash, is_deleted, last_modified_by FROM files WHERE storage_id = $1")
         .bind(uuid)
         .fetch_all(pool)
         .await?;
@@ -73,6 +84,7 @@ pub async fn load_storage_files(pool: &Pool<Postgres>, storage_id: &str) -> Resu
             version: row.get::<i64, _>("version") as u64,
             hash: row.get("hash"),
             is_deleted: row.get("is_deleted"),
+            last_modified_by: row.get("last_modified_by"), // Load it
         };
         map.insert(meta.path.clone(), meta);
     }
@@ -84,14 +96,15 @@ pub async fn save_file(pool: &Pool<Postgres>, storage_id: &str, meta: &FileMetad
 
     sqlx::query(
         r#"
-        INSERT INTO files (storage_id, path, size, modified, version, hash, is_deleted)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO files (storage_id, path, size, modified, version, hash, is_deleted, last_modified_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (storage_id, path) DO UPDATE
         SET size = EXCLUDED.size,
             modified = EXCLUDED.modified,
             version = EXCLUDED.version,
             hash = EXCLUDED.hash,
-            is_deleted = EXCLUDED.is_deleted
+            is_deleted = EXCLUDED.is_deleted,
+            last_modified_by = EXCLUDED.last_modified_by
         "#
     )
     .bind(uuid)
@@ -101,6 +114,7 @@ pub async fn save_file(pool: &Pool<Postgres>, storage_id: &str, meta: &FileMetad
     .bind(meta.version as i64)
     .bind(&meta.hash)
     .bind(meta.is_deleted)
+    .bind(&meta.last_modified_by)
     .execute(pool)
     .await?;
 

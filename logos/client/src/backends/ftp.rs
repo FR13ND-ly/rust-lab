@@ -61,6 +61,7 @@ impl StorageBackend for FtpBackend {
                     version: 0,
                     hash: String::new(),
                     is_deleted: false,
+                    last_modified_by: None,
                 });
             }
             Ok(files)

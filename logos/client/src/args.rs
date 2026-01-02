@@ -5,11 +5,13 @@ use url::Url;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Args {
-    #[arg(required = true, num_args = 1..)]
     pub locations: Vec<String>,
 
     #[arg(long, default_value = "default_secret")]
     pub secret: String,
+
+    #[arg(short, long)]
+    pub config: Option<String>,
 }
 
 #[derive(Debug, Clone)]
