@@ -1,6 +1,7 @@
 use common::{FileMetadata, StorageInfo};
 use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -29,21 +30,26 @@ pub async fn init_db(pool: &Pool<Postgres>) -> Result<(), sqlx::Error> {
         "#
     ).execute(pool).await?;
 
-    let _ = sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS last_modified_by TEXT").execute(pool).await;
+    sqlx::query("ALTER TABLE files ADD COLUMN IF NOT EXISTS last_modified_by TEXT")
+        .execute(pool)
+        .await?;
     
     Ok(())
 }
-
 
 pub async fn list_storages(pool: &Pool<Postgres>) -> Result<Vec<StorageInfo>, sqlx::Error> {
     let rows = sqlx::query("SELECT id, name FROM storages ORDER BY name ASC")
         .fetch_all(pool)
         .await?;
 
-    Ok(rows.into_iter().map(|r| StorageInfo {
-        id: r.get::<uuid::Uuid, _>("id").to_string(),
-        name: r.get("name"),
-    }).collect())
+    let mut storages = Vec::new();
+    for r in rows {
+        storages.push(StorageInfo {
+            id: r.try_get::<Uuid, _>("id")?.to_string(),
+            name: r.try_get("name")?,
+        });
+    }
+    Ok(storages)
 }
 
 pub async fn create_storage(pool: &Pool<Postgres>, name: &str) -> Result<StorageInfo, sqlx::Error> {
@@ -53,22 +59,34 @@ pub async fn create_storage(pool: &Pool<Postgres>, name: &str) -> Result<Storage
         .await?;
 
     Ok(StorageInfo {
-        id: row.get::<uuid::Uuid, _>("id").to_string(),
-        name: row.get("name"),
+        id: row.try_get::<Uuid, _>("id")?.to_string(),
+        name: row.try_get("name")?,
     })
 }
 
 pub async fn delete_storage(pool: &Pool<Postgres>, storage_id: &str) -> Result<(), sqlx::Error> {
-    let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
+    let uuid = Uuid::parse_str(storage_id)
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM files WHERE storage_id = $1").bind(uuid).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM storages WHERE id = $1").bind(uuid).execute(&mut *tx).await?;
+    
+    sqlx::query("DELETE FROM files WHERE storage_id = $1")
+        .bind(uuid)
+        .execute(&mut *tx)
+        .await?;
+        
+    sqlx::query("DELETE FROM storages WHERE id = $1")
+        .bind(uuid)
+        .execute(&mut *tx)
+        .await?;
+        
     tx.commit().await?;
     Ok(())
 }
 
 pub async fn load_storage_files(pool: &Pool<Postgres>, storage_id: &str) -> Result<HashMap<String, FileMetadata>, sqlx::Error> {
-    let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
+    let uuid = Uuid::parse_str(storage_id)
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     
     let rows = sqlx::query("SELECT path, size, modified, version, hash, is_deleted, last_modified_by FROM files WHERE storage_id = $1")
         .bind(uuid)
@@ -78,13 +96,13 @@ pub async fn load_storage_files(pool: &Pool<Postgres>, storage_id: &str) -> Resu
     let mut map = HashMap::new();
     for row in rows {
         let meta = FileMetadata {
-            path: row.get("path"),
-            size: row.get::<i64, _>("size") as u64,
-            modified: row.get::<i64, _>("modified") as u64,
-            version: row.get::<i64, _>("version") as u64,
-            hash: row.get("hash"),
-            is_deleted: row.get("is_deleted"),
-            last_modified_by: row.get("last_modified_by"), // Load it
+            path: row.try_get("path")?,
+            size: row.try_get::<i64, _>("size")? as u64,
+            modified: row.try_get::<i64, _>("modified")? as u64,
+            version: row.try_get::<i64, _>("version")? as u64,
+            hash: row.try_get("hash")?,
+            is_deleted: row.try_get("is_deleted")?,
+            last_modified_by: row.try_get("last_modified_by")?,
         };
         map.insert(meta.path.clone(), meta);
     }
@@ -92,7 +110,8 @@ pub async fn load_storage_files(pool: &Pool<Postgres>, storage_id: &str) -> Resu
 }
 
 pub async fn save_file(pool: &Pool<Postgres>, storage_id: &str, meta: &FileMetadata) -> Result<(), sqlx::Error> {
-    let uuid = uuid::Uuid::parse_str(storage_id).unwrap();
+    let uuid = Uuid::parse_str(storage_id)
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
 
     sqlx::query(
         r#"

@@ -15,12 +15,12 @@ impl AppConfig {
             match fs::read_to_string(path).await {
                 Ok(content) => match serde_json::from_str(&content) {
                     Ok(cfg) => {
-                        println!("📄 Loaded configuration from {}", path);
+                        println!("[+] Loaded configuration from {}", path);
                         return cfg;
                     },
-                    Err(e) => eprintln!("⚠️ Failed to parse config: {}", e),
+                    Err(e) => eprintln!("[!] Failed to parse config: {}", e),
                 },
-                Err(e) => eprintln!("⚠️ Failed to read config file: {}", e),
+                Err(e) => eprintln!("[!] Failed to read config file: {}", e),
             }
         }
         Self::default()
@@ -30,12 +30,12 @@ impl AppConfig {
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
                 if let Err(e) = fs::write(path, json).await {
-                    eprintln!("⚠️ Failed to save config to {}: {}", path, e);
+                    eprintln!("[!] Failed to save config to {}: {}", path, e);
                 } else {
-                    println!("💾 Configuration saved to {}", path);
+                    println!("[+] Configuration saved to {}", path);
                 }
             },
-            Err(e) => eprintln!("⚠️ Failed to serialize config: {}", e),
+            Err(e) => eprintln!("[!] Failed to serialize config: {}", e),
         }
     }
 }

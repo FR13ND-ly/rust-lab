@@ -8,7 +8,6 @@ pub trait StorageBackend: Send + Sync {
     async fn read_file(&self, path: &str) -> Result<Vec<u8>>;
     async fn write_file(&self, path: &str, content: &[u8]) -> Result<()>;
     async fn delete_file(&self, path: &str) -> Result<()>;
-    fn get_id(&self) -> String;
     
     fn is_read_only(&self) -> bool { false }
 }

@@ -67,7 +67,7 @@ impl AppState {
 
         let new_state = incoming.clone();
         if let Err(e) = db::save_file(&self.db, storage_id, &new_state).await {
-            tracing::error!("🔥 DB Error: {}", e);
+            tracing::error!("Database error: {}", e);
             return None;
         }
 
@@ -92,8 +92,9 @@ impl AppState {
     pub async fn emit_storage_list(&self) {
         if let Ok(list) = db::list_storages(&self.db).await {
              let resp = Message::StorageList { storages: list };
-             let json = serde_json::to_string(&resp).unwrap();
-             self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+             if let Ok(json) = serde_json::to_string(&resp) {
+                self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+             }
         }
     }
 
@@ -103,8 +104,9 @@ impl AppState {
             message: message.to_string(),
             timestamp: chrono::Utc::now().timestamp() as u64,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+        if let Ok(json) = serde_json::to_string(&msg) {
+            self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+        }
     }
 
     pub fn emit_stats(&self) {
@@ -130,8 +132,9 @@ impl AppState {
             total_files,
             client_details,
         };
-        let json = serde_json::to_string(&msg).unwrap();
-        self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+        if let Ok(json) = serde_json::to_string(&msg) {
+            self.broadcast_dashboard(axum::extract::ws::Message::Text(json));
+        }
     }
 
     fn broadcast_dashboard(&self, msg: axum::extract::ws::Message) {
