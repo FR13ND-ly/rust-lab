@@ -1,5 +1,5 @@
 {
   "client_name": "MOTRI",
-  "location": "folder:./data_b",
-  "storage_id": "0f447cd3-2d9a-424f-b046-e50242d805a2"
+  "location": "sftp://mag:Wellcome#1989@64.176.64.16:22\\home\\mag\\test3",
+  "storage_id": "4fdac08e-9207-49d2-ab43-8a930ce0f4f8"
 }
